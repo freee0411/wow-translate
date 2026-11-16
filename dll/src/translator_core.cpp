@@ -35,8 +35,8 @@ using namespace std;
 //   这样换 key 不用重新编译，也不会把 key 写进源码里到处传。
 // ============================================================================
 static const char* DEEPSEEK_HOST  = "api.deepseek.com";
-static const char* DEEPSEEK_MODEL = "deepseek-v4-flash";   // 主模型（快、便宜）
-static const char* DEEPSEEK_FALLBACK_MODEL = "deepseek-chat"; // 主模型名被拒时自动回退（映射到 v4-flash 非思考模式）
+static const char* DEEPSEEK_MODEL  = "deepseek-flash";   // 当前正式名（V4.1-Flash）
+static const char* DEEPSEEK_FALLBACK_MODEL = "deepseek-v4-flash"; // 主模型名被拒时自动回退（仍被路由到同一模型）
 static const char* DEEPSEEK_API_KEY = "";                  // 留空则从环境变量/文件读
 
 // 英文译文是否强制小写开头（去掉书面式的首字母大写）。想保留原样改成 false。
@@ -171,6 +171,21 @@ static string AnsiToUtf8(const string& s) {
     return u;
 }
 
+// 反向：把 API 返回的 UTF-8 译文转回系统 ANSI（中文 Windows 上是 GBK），
+// 客户端聊天框才认。返回空则视为无法转换，调用方保留 UTF-8 原样。
+static string Utf8ToAnsi(const string& s) {
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (wlen <= 0) return "";
+    wstring w(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], wlen);
+
+    int alen = WideCharToMultiByte(CP_ACP, 0, w.c_str(), wlen, nullptr, 0, nullptr, nullptr);
+    if (alen <= 0) return "";
+    string a(alen, '\0');
+    WideCharToMultiByte(CP_ACP, 0, w.c_str(), wlen, &a[0], alen, nullptr, nullptr);
+    return a;
+}
+
 static string ReadWholeFile(const string& path) {
     ifstream f(path.c_str(), ios::in | ios::binary);
     if (!f) return "";
@@ -239,7 +254,8 @@ static string BuildRequestBody(const string& model, const string& sysPrompt,
     string body = "{\"model\":\"" + model + "\",\"messages\":["
                   "{\"role\":\"system\",\"content\":\"" + EscapeJson(sysPrompt) + "\"},"
                   "{\"role\":\"user\",\"content\":\"" + EscapeJson(text) + "\"}"
-                  "],\"temperature\":0,\"stream\":false";
+                  "],\"temperature\":0,\"stream\":false"
+                  ",\"thinking\":{\"type\":\"disabled\"}";
     if (!g_omitMaxTokens) body += ",\"max_tokens\":" + to_string(maxTokens);
     body += "}";
     return body;
@@ -679,8 +695,13 @@ TranslationResult TranslationClient::TranslateText(const string& text, string& r
         return TranslationResult::API_ERROR;
     }
 
+    // 中文 1.12 客户端聊天是 ANSI(GBK) 编码，而 API 只接受 UTF-8。
+    // 不是合法 UTF-8 就按系统 ANSI 代码页（中文系统=GBK）转一次，译文出站时再转回去。
+    bool inputWasAnsi = !LooksLikeUtf8(text);
+    string sendText = inputWasAnsi ? AnsiToUtf8(text) : text;
+
     string sysPrompt = BuildSystemPrompt(targetLang);
-    int maxTokens = EstimateMaxTokens(text);
+    int maxTokens = EstimateMaxTokens(sendText);
     string headers = "Content-Type: application/json\r\n"
                      "Accept: application/json\r\n"
                      "Authorization: Bearer " + g_apiKey + "\r\n";
@@ -701,7 +722,7 @@ TranslationResult TranslationClient::TranslateText(const string& text, string& r
         }
 
         for (int attempt = 0; attempt < 2; ++attempt) {
-            string body = BuildRequestBody(models[mi], sysPrompt, text, maxTokens);
+            string body = BuildRequestBody(models[mi], sysPrompt, sendText, maxTokens);
 
             bool sent = HttpsPostJson(hConnect, L"/chat/completions", body, headers, response, status);
 
@@ -764,11 +785,17 @@ TranslationResult TranslationClient::TranslateText(const string& text, string& r
     LOG_DEBUG("Response: " + response.substr(0, 200));
 
     string content = ParseChatCompletionContent(response);
-    string translation = CleanTranslation(content, text, targetLang);
+    string translation = CleanTranslation(content, sendText, targetLang);
 
     if (translation.empty()) {
         LOG_ERROR("DeepSeek returned unusable content: " + response.substr(0, 300));
         return TranslationResult::API_ERROR;
+    }
+
+    // 客户端要的是 ANSI(GBK) 字节：输入是 ANSI 的话，译文也转回 ANSI 再交给 Lua
+    if (inputWasAnsi) {
+        string back = Utf8ToAnsi(translation);
+        if (!back.empty()) translation = back;
     }
 
     // 记一下用量，便于估算成本（v4-flash：输入 0.14/M，输出 0.28/M 美元）
